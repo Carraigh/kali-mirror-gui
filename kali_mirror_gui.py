@@ -21,16 +21,16 @@ KALI_MIRRORS = [
 def install_dependencies():
     """Установка зависимостей в venv"""
     if not os.path.exists(venv_dir):
-        messagebox.showinfo("Установка", "Создаю виртуальное окружение и устанавливаю зависимости...")
+        print("[INFO] Создаю виртуальное окружение...")
         subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
 
     pip_path = os.path.join(venv_dir, "bin", "pip") if os.name != "nt" else os.path.join(venv_dir, "Scripts", "pip")
     try:
         # Установка зависимостей
-        subprocess.check_call([pip_path, "install", "tk", "subprocess32"])
-        messagebox.showinfo("Готово", "Зависимости установлены!")
+        subprocess.check_call([pip_path, "install", "tk"])
+        print("[INFO] Зависимости установлены!")
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось установить зависимости:\n{e}")
+        print(f"[ERROR] Не удалось установить зависимости: {e}")
         sys.exit(1)
 
 class MirrorApp:
@@ -97,14 +97,20 @@ class MirrorApp:
             self.run_cmd("sudo apt-get clean -y")
 
             self.log("[+] Готово!")
-            messagebox.showinfo("Готово", "Обновление и очистка успешно выполнены.")
+            self.show_info("Готово", "Обновление и очистка успешно выполнены.")
         except Exception as e:
             self.log(f"[!] Ошибка: {str(e)}")
-            messagebox.showerror("Ошибка", str(e))
+            self.show_error("Ошибка", str(e))
         finally:
             self.progress.stop()
             self.process_running = False
             self.run_button.config(state='normal')
+
+    def show_info(self, title, message):
+        self.root.after(0, lambda: messagebox.showinfo(title, message))
+
+    def show_error(self, title, message):
+        self.root.after(0, lambda: messagebox.showerror(title, message))
 
     def find_best_mirror(self):
         tmp_ping = tempfile.mktemp()
@@ -177,16 +183,12 @@ class MirrorApp:
             raise Exception(f"Команда завершена с ошибкой: {cmd}")
 
 if __name__ == "__main__":
-    # Автоматически перезапускаемся внутри venv, если нужно
-    if getattr(sys, 'frozen', False):
-        # Мы внутри собранного PyInstaller-файла → не трогаем venv
-        pass
-    else:
-        # Работаем как обычный Python-скрипт
-        if not os.getenv('VIRTUAL_ENV'):
-            install_dependencies()
-            venv_python = os.path.join(venv_dir, "Scripts", "python") if os.name == "nt" else os.path.join(venv_dir, "bin", "python")
-            os.execl(venv_python, venv_python, os.path.abspath(sys.argv[0]))
+    # Если не в venv и не frozen — установим зависимости и перезапустимся
+    if not os.getenv('VIRTUAL_ENV') and not sys.executable.endswith("venv/bin/python"):
+        print("[INFO] Перезапуск внутри виртуального окружения...")
+        install_dependencies()
+        venv_python = os.path.join(venv_dir, "bin", "python")
+        os.execl(venv_python, venv_python, os.path.abspath(sys.argv[0]))
 
     # Запуск GUI
     root = tk.Tk()

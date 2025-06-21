@@ -17,9 +17,10 @@ Kali Mirror GUI Updater
 1. Через Python (с виртуальным окружением)
 
 cd ~/kali-mirror-gui
-python kali_mirror_gui.py
+export DISPLAY=:0
+sudo -E python kali_mirror_gui.py
 
-⚠️ Требуется предварительно создать и активировать виртуальное окружение с зависимостями: 
+⚠️ Требуется предварительно создать и активировать виртуальное окружение с зависимостями(только в первый раз): 
 
 python3 -m venv venv
 source venv/bin/activate
