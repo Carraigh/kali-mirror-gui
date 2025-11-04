@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Kali Mirror Updater
+Comment=Автоматический выбор и настройка лучшего зеркала Kali Linux
+Exec=sudo python3 /home/neadmin/kali-mirror-gui/kali_mirror_gui.py
+Icon=system-software-update
+Terminal=false
+Categories=System;Settings;Utility;
+StartupNotify=true
+Keywords=mirror;kali;update;apt;

@@ -1,196 +1,291 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import subprocess
-import os
-import tempfile
-import threading
+#!/usr/bin/env python3
 import sys
+import os
 
-# Проверяем, есть ли виртуальное окружение
-venv_dir = os.path.join(os.path.dirname(__file__), "venv")
-script_dir = os.path.dirname(__file__)
+# Добавляем ./lib в путь поиска модулей
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 
-KALI_MIRRORS = [
-    "https://http.kali.org/kali", 
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, simpledialog
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+
+import subprocess
+import threading
+import time
+import shutil
+import logging
+import requests
+
+# === Настройки ===
+LOG_FILE = "/var/log/kali-mirror-gui.log"
+USER_MIRRORS_FILE = os.path.expanduser("~/.config/kali-mirror-gui/mirrors.txt")
+DEFAULT_MIRRORS = [
+    "https://http.kali.org/kali",
     "http://ftp.halifax.rwth-aachen.de/kali",
     "http://kali.mirror.garr.it/mirrors/kali",
     "http://mirror.csclub.uwaterloo.ca/kali",
     "http://kali.download/kali"
 ]
 
-def install_dependencies():
-    """Установка зависимостей в venv"""
-    if not os.path.exists(venv_dir):
-        print("[INFO] Создаю виртуальное окружение...")
-        subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
-
-    pip_path = os.path.join(venv_dir, "bin", "pip") if os.name != "nt" else os.path.join(venv_dir, "Scripts", "pip")
-    try:
-        # Установка зависимостей
-        subprocess.check_call([pip_path, "install", "tk"])
-        print("[INFO] Зависимости установлены!")
-    except Exception as e:
-        print(f"[ERROR] Не удалось установить зависимости: {e}")
-        sys.exit(1)
+# === Логирование ===
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(USER_MIRRORS_FILE), exist_ok=True)
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    encoding="utf-8"
+)
 
 class MirrorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Kali Mirror Updater")
-        self.root.geometry("500x400")
+        self.root.title("Kali Mirror Updater ✨")
+        self.root.geometry("600x500")
         self.root.resizable(True, True)
 
+        if os.geteuid() != 0:
+            messagebox.showerror("Ошибка", "Запустите с sudo!")
+            sys.exit(1)
+
+        # Проверяем, что мы в Kali
+        if not self.is_kali():
+            self.log("[!] Это не Kali Linux — продолжаем с осторожностью.")
+
         self.process_running = False
+        self.cancel_event = threading.Event()
         self.current_process = None
 
-        # Лог-поле
-        self.text_box = tk.Text(self.root, wrap="word", height=18, width=60, state='disabled')
-        self.text_box.pack(pady=10)
+        # UI
+        self.text_box = tk.Text(self.root, wrap="word", height=22, width=80, state='disabled', font=("Monospace", 9))
+        self.text_box.pack(pady=10, padx=10)
 
-        # Контроллеры
         self.btn_frame = tk.Frame(self.root)
         self.btn_frame.pack(pady=5)
 
-        self.run_button = ttk.Button(self.btn_frame, text="Начать проверку зеркал", command=self.start_process)
+        self.run_button = ttk.Button(self.btn_frame, text="🔍 Найти лучшее зеркало", command=self.start_process)
         self.run_button.pack(side="left", padx=5)
 
-        self.progress = ttk.Progressbar(self.root, orient="horizontal", length=400, mode="indeterminate")
+        self.add_mirror_btn = ttk.Button(self.btn_frame, text="➕ Добавить зеркало", command=self.add_custom_mirror)
+        self.add_mirror_btn.pack(side="left", padx=5)
+
+        self.cancel_button = ttk.Button(self.btn_frame, text="❌ Отмена", command=self.cancel_process, state='disabled')
+        self.cancel_button.pack(side="left", padx=5)
+
+        self.progress = ttk.Progressbar(self.root, orient="horizontal", length=560, mode="indeterminate")
         self.progress.pack(pady=5)
 
-    def log(self, message):
-        self.text_box.config(state='normal')
-        self.text_box.insert(tk.END, message + "\n")
-        self.text_box.config(state='disabled')
-        self.text_box.see(tk.END)
+        # Тема
+        try:
+            import sv_ttk
+            sv_ttk.set_theme("dark")
+        except Exception as e:
+            self.log(f"[!] Не удалось загрузить sv_ttk: {e}")
+
+    def log(self, msg):
+        print(msg)  # Выводим в консоль тоже
+        if GUI_AVAILABLE:
+            self.text_box.config(state='normal')
+            self.text_box.insert(tk.END, msg + "\n")
+            self.text_box.config(state='disabled')
+            self.text_box.see(tk.END)
+        logging.info(msg)
+
+    def is_kali(self):
+        try:
+            with open("/etc/os-release") as f:
+                return "kali" in f.read().lower()
+        except:
+            return False
+
+    def load_mirrors(self):
+        mirrors = DEFAULT_MIRRORS.copy()
+        if os.path.exists(USER_MIRRORS_FILE):
+            with open(USER_MIRRORS_FILE) as f:
+                for line in f:
+                    url = line.strip()
+                    if url and url not in mirrors:
+                        mirrors.append(url)
+        return mirrors
+
+    def save_custom_mirror(self, url):
+        if not url.startswith(("http://", "https://")):
+            return False
+        with open(USER_MIRRORS_FILE, "a") as f:
+            f.write(url + "\n")
+        return True
+
+    def add_custom_mirror(self):
+        if not GUI_AVAILABLE:
+            url = input("Введите URL зеркала (например, https://mirror.example.com/kali): ")
+            if self.save_custom_mirror(url):
+                self.log(f"[+] Добавлено пользовательское зеркало: {url}")
+            else:
+                print("Некорректный URL.")
+            return
+        url = simpledialog.askstring("Новое зеркало", "Введите URL зеркала (например, https://mirror.example.com/kali):")
+        if url:
+            if self.save_custom_mirror(url):
+                self.log(f"[+] Добавлено пользовательское зеркало: {url}")
+            else:
+                messagebox.showerror("Ошибка", "Некорректный URL.")
+
+    def has_internet(self):
+        try:
+            requests.get("https://1.1.1.1", timeout=3)
+            return True
+        except:
+            return False
 
     def start_process(self):
         if self.process_running:
             return
+        if not self.has_internet():
+            if GUI_AVAILABLE:
+                messagebox.showerror("Нет интернета", "Проверьте подключение к интернету.")
+            else:
+                print("Нет интернета — проверьте подключение.")
+            return
+        self.cancel_event.clear()
         self.run_button.config(state='disabled')
+        self.add_mirror_btn.config(state='disabled')
+        self.cancel_button.config(state='normal')
         self.progress.start()
         self.process_running = True
         self.log("[+] Запуск процесса...")
-        threading.Thread(target=self.full_update_process).start()
+        threading.Thread(target=self.full_update_process, daemon=True).start()
+
+    def cancel_process(self):
+        self.log("[!] Отмена...")
+        self.cancel_event.set()
+        if self.current_process:
+            try:
+                self.current_process.terminate()
+                self.current_process.wait(timeout=3)
+            except:
+                pass
 
     def full_update_process(self):
         try:
-            self.log("[+] Поиск лучшего зеркала...")
-            best_mirror = self.find_best_mirror()
-            if not best_mirror:
-                raise Exception("Не найдено рабочих зеркал.")
+            mirrors = self.load_mirrors()
+            self.log(f"[+] Проверка {len(mirrors)} зеркал...")
 
-            self.log(f"[+] Лучшее зеркало: {best_mirror}")
-            self.set_sources_list(best_mirror)
+            best = self.find_best_mirror(mirrors)
+            if not best:
+                raise Exception("Ни одно зеркало не отвечает.")
 
-            self.log("[+] Обновление пакетов...")
-            self.run_cmd("sudo apt-get update -y")
+            self.log(f"[+] Выбрано: {best}")
+            self.set_sources_list(best)
+            if self.cancel_event.is_set(): return
 
-            self.log("[+] Обновление системы...")
-            self.run_cmd("sudo apt-get upgrade -y")
+            self.run_cmd("apt-get update -y")
+            if self.cancel_event.is_set(): return
 
-            self.log("[+] Исправление зависимостей (install -f)...")
-            self.run_cmd("sudo apt-get install -f -y")
+            self.run_cmd("apt-get upgrade -y")
+            if self.cancel_event.is_set(): return
 
-            self.log("[+] Очистка системы...")
-            self.run_cmd("sudo apt-get autoremove -y")
-            self.run_cmd("sudo apt-get autoclean -y")
-            self.run_cmd("sudo apt-get clean -y")
+            self.run_cmd("apt-get install -f -y")
+            if self.cancel_event.is_set(): return
 
-            self.log("[+] Готово!")
-            self.show_info("Готово", "Обновление и очистка успешно выполнены.")
+            self.run_cmd("apt-get autoremove -y")
+            self.run_cmd("apt-get autoclean -y")
+            self.run_cmd("apt-get clean -y")
+
+            self.log("[✅] Готово!")
+            if GUI_AVAILABLE:
+                messagebox.showinfo("Успех", "Система обновлена и очищена!")
+            else:
+                print("✅ Система обновлена и очищена!")
         except Exception as e:
-            self.log(f"[!] Ошибка: {str(e)}")
-            self.show_error("Ошибка", str(e))
+            err = str(e)
+            self.log(f"[!] Ошибка: {err}")
+            if GUI_AVAILABLE:
+                messagebox.showerror("Ошибка", err)
+            else:
+                print(f"❌ Ошибка: {err}")
         finally:
-            self.progress.stop()
-            self.process_running = False
-            self.run_button.config(state='normal')
+            if GUI_AVAILABLE:
+                self.progress.stop()
+                self.process_running = False
+                self.run_button.config(state='normal')
+                self.add_mirror_btn.config(state='normal')
+                self.cancel_button.config(state='disabled')
 
-    def show_info(self, title, message):
-        self.root.after(0, lambda: messagebox.showinfo(title, message))
-
-    def show_error(self, title, message):
-        self.root.after(0, lambda: messagebox.showerror(title, message))
-
-    def find_best_mirror(self):
-        tmp_ping = tempfile.mktemp()
-        with open(tmp_ping, 'w') as f:
-            pass
-
-        for mirror in KALI_MIRRORS:
-            host = mirror.split("//")[1].split("/")[0]
-            self.log(f"[-] Проверяю {host}...")
-
-            ping_test = subprocess.run(["ping", "-c", "2", host], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if ping_test.returncode != 0:
-                continue
-
-            ping_result = subprocess.run(["ping", "-c", "5", host], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            avg_ping = self.parse_ping_output(ping_result.stdout)
-            with open(tmp_ping, "a") as f:
-                f.write(f"{avg_ping} {mirror}\n")
-
-        if not os.path.exists(tmp_ping):
+    def find_best_mirror(self, mirrors):
+        results = []
+        for mirror in mirrors:
+            if self.cancel_event.is_set():
+                return None
+            url = f"{mirror.rstrip('/')}/dists/kali-rolling/InRelease"
+            try:
+                self.log(f"[-] Тестирую {mirror}...")
+                start = time.time()
+                resp = requests.head(url, timeout=8)
+                if resp.status_code == 200:
+                    latency = time.time() - start
+                    results.append((latency, mirror))
+                    self.log(f"    ✅ {latency:.2f}s")
+                else:
+                    self.log(f"    ❌ HTTP {resp.status_code}")
+            except Exception as e:
+                self.log(f"    ❌ Ошибка: {e}")
+        if not results:
             return None
-
-        result = subprocess.run(["sort", "-n", tmp_ping], stdout=subprocess.PIPE, text=True)
-        best_line = result.stdout.strip().splitlines()[0]
-        os.remove(tmp_ping)
-        return best_line.split(" ", 1)[1]
-
-    @staticmethod
-    def parse_ping_output(output):
-        for line in output.splitlines():
-            if "min/avg/max" in line:
-                parts = line.split("/")
-                try:
-                    avg = float(parts[1])
-                    return avg
-                except (IndexError, ValueError):
-                    pass
-        return 9999
+        results.sort(key=lambda x: x[0])
+        return results[0][1]
 
     def set_sources_list(self, mirror):
-        sources_content = f"deb {mirror} kali-rolling main contrib non-free non-free-firmware\n"
-        with open("/tmp/sources.list", "w") as f:
-            f.write(sources_content)
-        self.run_cmd("sudo mv /tmp/sources.list /etc/apt/sources.list")
+        bak = "/etc/apt/sources.list.bak"
+        if not os.path.exists(bak):
+            shutil.copy2("/etc/apt/sources.list", bak)
+            self.log(f"[+] Создан бэкап: {bak}")
+
+        content = f"deb {mirror} kali-rolling main contrib non-free non-free-firmware\n"
+        tmp = "/tmp/sources.list"
+        with open(tmp, "w") as f:
+            f.write(content)
+        shutil.move(tmp, "/etc/apt/sources.list")
+        self.log("[OK] sources.list обновлён")
 
     def run_cmd(self, cmd):
-        self.log(f"Выполняется: {cmd}")
-        process = subprocess.Popen(
-            cmd.split(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        self.current_process = process
+        if self.cancel_event.is_set():
+            return
+        self.log(f"> {cmd}")
+        try:
+            proc = subprocess.Popen(
+                cmd.split(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            self.current_process = proc
+            for line in iter(proc.stdout.readline, ''):
+                if self.cancel_event.is_set():
+                    proc.terminate()
+                    raise Exception("Отменено пользователем")
+                if line.strip():
+                    self.log("  " + line.rstrip())
+            proc.wait()
+            if proc.returncode != 0:
+                raise Exception(f"Ошибка выполнения: {cmd}")
+        finally:
+            self.current_process = None
 
-        while process.poll() is None:
-            line = process.stdout.readline()
-            if line:
-                self.log("   " + line.strip())
+def main():
+    if not GUI_AVAILABLE:
+        print("⚠️  GUI недоступен — запускаю в режиме командной строки.")
+        app = MirrorApp(None)  # Можно передать None, если GUI не нужен
+        app.full_update_process()
+        return
 
-        # Читаем остаток вывода после завершения
-        for line in process.stdout:
-            self.log("   " + line.strip())
-
-        self.current_process = None
-
-        if process.returncode != 0:
-            raise Exception(f"Команда завершена с ошибкой: {cmd}")
-
-if __name__ == "__main__":
-    # Если не в venv и не frozen — установим зависимости и перезапустимся
-    if not os.getenv('VIRTUAL_ENV') and not sys.executable.endswith("venv/bin/python"):
-        print("[INFO] Перезапуск внутри виртуального окружения...")
-        install_dependencies()
-        venv_python = os.path.join(venv_dir, "bin", "python")
-        os.execl(venv_python, venv_python, os.path.abspath(sys.argv[0]))
-
-    # Запуск GUI
     root = tk.Tk()
     app = MirrorApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
